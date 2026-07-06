@@ -1,0 +1,752 @@
+// CRM data model. Every tenant-scoped row carries `tenantId` and is filtered
+// at the query layer (see src/common/prisma/tenant.extension.ts).
+//
+// Phase 1 builds out: Tenant, User, Role, Permission, Team, Territory, Session,
+// AuditLog. The remaining objects (Lead..WebhookEvent) are defined now so the
+// schema is stable; their APIs/UI arrive in later phases.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Enums
+// ──────────────────────────────────────────────────────────────────────────
+
+enum DataScope {
+  OWN
+  TEAM
+  TERRITORY
+  TENANT
+}
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  DEACTIVATED
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  UNQUALIFIED
+  CONVERTED
+}
+
+enum ActivityType {
+  CALL
+  MEETING
+  NOTE
+  TASK
+  EMAIL
+  WHATSAPP
+  SMS
+}
+
+enum MessageChannel {
+  EMAIL
+  WHATSAPP
+  SMS
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  RECEIVED
+}
+
+enum CallDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum CustomFieldType {
+  TEXT
+  NUMBER
+  DATE
+  DATETIME
+  BOOLEAN
+  DROPDOWN
+  MULTISELECT
+  LOOKUP
+}
+
+enum IntegrationProvider {
+  META_LEAD_ADS
+  GOOGLE_ADS
+  WEBSITE_FORM
+  GENERIC_INBOUND
+  EMAIL
+  WHATSAPP
+  SMS
+  VOICE
+  SLACK
+}
+
+enum WebhookVerificationStatus {
+  PENDING
+  VERIFIED
+  FAILED
+}
+
+enum WebhookProcessingStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  DEAD_LETTER
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  PUSH
+  SLACK
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Tenancy, identity, RBAC
+// ──────────────────────────────────────────────────────────────────────────
+
+model Tenant {
+  id        String    @id @default(cuid())
+  name      String
+  slug      String    @unique
+  currency  String    @default("INR")
+  timezone  String    @default("Asia/Kolkata")
+  isClient  Boolean   @default(false) // client account vs the agency itself
+  settings  Json      @default("{}")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  users       User[]
+  roles       Role[]
+  teams       Team[]
+  territories Territory[]
+
+  @@map("tenants")
+}
+
+// Catalog of all permission keys (e.g. "lead:create"). Seeded globally;
+// roles reference these keys via Role.permissions[].
+model Permission {
+  key         String @id // "<resource>:<action>"
+  resource    String
+  action      String
+  description String
+
+  @@map("permissions")
+}
+
+model Role {
+  id                String    @id @default(cuid())
+  tenantId          String
+  name              String
+  description       String?
+  isSystem          Boolean   @default(false) // seeded default roles
+  dataScope         DataScope @default(OWN)
+  permissions       String[]  @default([]) // permission keys from Permission catalog
+  fieldRestrictions Json      @default("{}") // { "<resource>": ["fieldA", ...] } hidden fields
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  users  User[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+model Team {
+  id        String    @id @default(cuid())
+  tenantId  String
+  name      String
+  managerId String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  tenant  Tenant @relation(fields: [tenantId], references: [id])
+  manager User?  @relation("TeamManager", fields: [managerId], references: [id])
+  members User[] @relation("TeamMembers")
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("teams")
+}
+
+model Territory {
+  id        String    @id @default(cuid())
+  tenantId  String
+  name      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  tenant  Tenant @relation(fields: [tenantId], references: [id])
+  members User[] @relation("TerritoryMembers")
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("territories")
+}
+
+model User {
+  id               String     @id @default(cuid())
+  tenantId         String
+  email            String
+  fullName         String
+  passwordHash     String?
+  status           UserStatus @default(INVITED)
+  roleId           String
+  teamId           String?
+  territoryId      String?
+  phone            String?
+  avatarUrl        String?
+  twoFactorSecret  String? // base32 TOTP secret (null = 2FA off)
+  twoFactorEnabled Boolean    @default(false)
+  lastLoginAt      DateTime?
+  invitedById      String?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+  deletedAt        DateTime?
+
+  tenant       Tenant     @relation(fields: [tenantId], references: [id])
+  role         Role       @relation(fields: [roleId], references: [id])
+  team         Team?      @relation("TeamMembers", fields: [teamId], references: [id])
+  territory    Territory? @relation("TerritoryMembers", fields: [territoryId], references: [id])
+  managedTeams Team[]     @relation("TeamManager")
+  sessions     Session[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@index([tenantId, roleId])
+  @@map("users")
+}
+
+// Server-side refresh-token sessions (revocable; powers session management).
+model Session {
+  id               String    @id @default(cuid())
+  tenantId         String
+  userId           String
+  refreshTokenHash String
+  userAgent        String?
+  ip               String?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([tenantId])
+  @@map("sessions")
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String
+  actorId    String? // null = system / unauthenticated
+  action     String // e.g. "user.login", "role.update"
+  resource   String // e.g. "User", "Role"
+  resourceId String?
+  before     Json?
+  after      Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, resource])
+  @@map("audit_logs")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Core CRM objects (schema only in Phase 1; APIs/UI land in Phase 2+)
+// ──────────────────────────────────────────────────────────────────────────
+
+model Lead {
+  id              String     @id @default(cuid())
+  tenantId        String
+  ownerId         String?
+  status          LeadStatus @default(NEW)
+  firstName       String?
+  lastName        String?
+  email           String?
+  phone           String?
+  company         String?
+  source          String? // meta_lead_ads, google_ads, website, generic, ...
+  campaign        String?
+  adId            String?
+  formId          String?
+  pageId          String?
+  score           Int        @default(0)
+  tags            String[]   @default([])
+  rawPayload      Json?
+  sourceDedupeKey String?
+  contactId       String?
+  customFields    Json       @default("{}")
+  createdById     String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  deletedAt       DateTime?
+
+  contact Contact? @relation(fields: [contactId], references: [id])
+
+  @@index([tenantId, status])
+  @@index([tenantId, ownerId])
+  @@index([tenantId, source])
+  @@index([tenantId, email])
+  @@index([tenantId, phone])
+  @@map("leads")
+}
+
+model Contact {
+  id           String    @id @default(cuid())
+  tenantId     String
+  ownerId      String?
+  firstName    String?
+  lastName     String?
+  email        String?
+  phone        String?
+  accountId    String?
+  tags         String[]  @default([])
+  customFields Json      @default("{}")
+  createdById  String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  account Account? @relation(fields: [accountId], references: [id])
+  leads   Lead[]
+  deals   Deal[]
+
+  @@index([tenantId, email])
+  @@index([tenantId, phone])
+  @@map("contacts")
+}
+
+model Account {
+  id           String    @id @default(cuid())
+  tenantId     String
+  ownerId      String?
+  name         String
+  domain       String?
+  industry     String?
+  customFields Json      @default("{}")
+  createdById  String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  contacts Contact[]
+  deals    Deal[]
+
+  @@index([tenantId])
+  @@map("accounts")
+}
+
+model Pipeline {
+  id        String    @id @default(cuid())
+  tenantId  String
+  name      String
+  isDefault Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  stages Stage[]
+  deals  Deal[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("pipelines")
+}
+
+model Stage {
+  id          String   @id @default(cuid())
+  tenantId    String
+  pipelineId  String
+  name        String
+  order       Int
+  probability Int      @default(0) // 0-100
+  isWon       Boolean  @default(false)
+  isLost      Boolean  @default(false)
+  rotDays     Int? // deal "rots" after N days idle in this stage
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  pipeline Pipeline @relation(fields: [pipelineId], references: [id])
+  deals    Deal[]
+
+  @@index([tenantId, pipelineId])
+  @@map("stages")
+}
+
+model Deal {
+  id                String    @id @default(cuid())
+  tenantId          String
+  ownerId           String?
+  pipelineId        String
+  stageId           String
+  contactId         String?
+  accountId         String?
+  title             String
+  value             Decimal   @default(0) @db.Decimal(14, 2)
+  currency          String    @default("INR")
+  probability       Int       @default(0)
+  expectedCloseDate DateTime?
+  stageEnteredAt    DateTime  @default(now())
+  tags              String[]  @default([])
+  customFields      Json      @default("{}")
+  createdById       String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  pipeline Pipeline @relation(fields: [pipelineId], references: [id])
+  stage    Stage    @relation(fields: [stageId], references: [id])
+  contact  Contact? @relation(fields: [contactId], references: [id])
+  account  Account? @relation(fields: [accountId], references: [id])
+
+  @@index([tenantId, pipelineId, stageId])
+  @@index([tenantId, ownerId])
+  @@map("deals")
+}
+
+model Activity {
+  id          String       @id @default(cuid())
+  tenantId    String
+  type        ActivityType
+  subject     String?
+  body        String?
+  assigneeId  String?
+  dueAt       DateTime?
+  completedAt DateTime?
+  // polymorphic link
+  leadId      String?
+  contactId   String?
+  dealId      String?
+  createdById String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+
+  @@index([tenantId, assigneeId, dueAt])
+  @@index([tenantId, leadId])
+  @@index([tenantId, contactId])
+  @@index([tenantId, dealId])
+  @@map("activities")
+}
+
+model Message {
+  id                String           @id @default(cuid())
+  tenantId          String
+  channel           MessageChannel
+  direction         MessageDirection
+  status            MessageStatus    @default(QUEUED)
+  providerMessageId String?
+  threadId          String?
+  templateId        String?
+  fromAddress       String?
+  toAddress         String?
+  subject           String?
+  body              String?
+  attachments       Json             @default("[]")
+  leadId            String?
+  contactId         String?
+  dealId            String?
+  ownerId           String?
+  sentAt            DateTime?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  @@index([tenantId, contactId])
+  @@index([tenantId, threadId])
+  @@index([tenantId, providerMessageId])
+  @@map("messages")
+}
+
+model Call {
+  id             String        @id @default(cuid())
+  tenantId       String
+  direction      CallDirection
+  fromNumber     String?
+  toNumber       String?
+  duration       Int? // seconds
+  recordingUrl   String?
+  disposition    String?
+  notes          String?
+  providerCallId String?
+  leadId         String?
+  contactId      String?
+  dealId         String?
+  ownerId        String?
+  startedAt      DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([tenantId, contactId])
+  @@index([tenantId, providerCallId])
+  @@map("calls")
+}
+
+model CustomObject {
+  id        String    @id @default(cuid())
+  tenantId  String
+  name      String
+  apiName   String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  fields CustomField[]
+
+  @@unique([tenantId, apiName])
+  @@index([tenantId])
+  @@map("custom_objects")
+}
+
+model CustomField {
+  id             String          @id @default(cuid())
+  tenantId       String
+  objectType     String // "Lead" | "Contact" | "Account" | "Deal" | customObjectId
+  customObjectId String?
+  name           String
+  apiName        String
+  type           CustomFieldType
+  required       Boolean         @default(false)
+  options        Json            @default("[]") // for DROPDOWN / MULTISELECT
+  order          Int             @default(0)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  deletedAt      DateTime?
+
+  customObject CustomObject? @relation(fields: [customObjectId], references: [id])
+
+  @@unique([tenantId, objectType, apiName])
+  @@index([tenantId, objectType])
+  @@map("custom_fields")
+}
+
+model Workflow {
+  id          String    @id @default(cuid())
+  tenantId    String
+  name        String
+  isActive    Boolean   @default(false)
+  trigger     Json // { type, config }
+  conditions  Json      @default("[]")
+  actions     Json      @default("[]")
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([tenantId, isActive])
+  @@map("workflows")
+}
+
+model Notification {
+  id        String              @id @default(cuid())
+  tenantId  String
+  userId    String
+  channel   NotificationChannel @default(IN_APP)
+  title     String
+  body      String?
+  entityRef String? // "Lead:<id>"
+  readAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  @@index([tenantId, userId, readAt])
+  @@map("notifications")
+}
+
+model IntegrationConnection {
+  id          String              @id @default(cuid())
+  tenantId    String
+  provider    IntegrationProvider
+  name        String
+  isActive    Boolean             @default(true)
+  config      Json                @default("{}") // non-secret config
+  secretsRef  String? // pointer to secrets manager / encrypted blob id
+  status      String              @default("disconnected")
+  lastSyncAt  DateTime?
+  lastErrorAt DateTime?
+  lastError   String?
+  apiKeyHash  String? // for inbound auth (generic webhook)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  deletedAt   DateTime?
+
+  webhookEvents WebhookEvent[]
+
+  @@index([tenantId, provider])
+  @@map("integration_connections")
+}
+
+model WebhookEvent {
+  id                 String                    @id @default(cuid())
+  tenantId           String
+  connectionId       String?
+  provider           IntegrationProvider
+  eventType          String?
+  providerEventId    String? // idempotency key
+  sourceIp           String?
+  verificationStatus WebhookVerificationStatus @default(PENDING)
+  processingStatus   WebhookProcessingStatus   @default(RECEIVED)
+  retries            Int                       @default(0)
+  rawPayload         Json
+  error              String?
+  createdAt          DateTime                  @default(now())
+  processedAt        DateTime?
+
+  connection IntegrationConnection? @relation(fields: [connectionId], references: [id])
+
+  @@unique([provider, providerEventId])
+  @@index([tenantId, provider, processingStatus])
+  @@map("webhook_events")
+}
+
+enum TemplateStatus {
+  DRAFT
+  APPROVED
+  REJECTED
+}
+
+// Reusable email / WhatsApp / SMS templates with {{merge}} variables.
+// WhatsApp proactive (outside the 24h window) requires an APPROVED template.
+model MessageTemplate {
+  id               String         @id @default(cuid())
+  tenantId         String
+  name             String
+  channel          MessageChannel
+  category         String? // e.g. MARKETING / UTILITY / AUTHENTICATION
+  language         String         @default("en")
+  subject          String? // email only
+  body             String // may contain {{variable}} placeholders
+  variables        String[]       @default([])
+  status           TemplateStatus @default(DRAFT)
+  providerTemplateId String?
+  createdById      String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  deletedAt        DateTime?
+
+  @@unique([tenantId, channel, name])
+  @@index([tenantId, channel])
+  @@map("message_templates")
+}
+
+// Rule-based lead scoring: points added when `condition` matches the lead.
+model ScoringRule {
+  id        String   @id @default(cuid())
+  tenantId  String
+  name      String
+  condition Json // { match: "AND"|"OR", rules: [{ field, op, value }] }
+  points    Int
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  @@index([tenantId])
+  @@map("scoring_rules")
+}
+
+// Per-user notification preferences (channels, quiet hours, muted triggers).
+model NotificationPreference {
+  id              String   @id @default(cuid())
+  tenantId        String
+  userId          String   @unique
+  channels        String[] @default(["IN_APP"]) // IN_APP, EMAIL, SLACK
+  slackWebhookUrl String?
+  quietHoursStart Int? // hour 0-23
+  quietHoursEnd   Int?
+  mutedTriggers   String[] @default([])
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([tenantId])
+  @@map("notification_preferences")
+}
+
+enum ImportStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// Background CSV/XLSX import job with progress + per-row error report.
+model ImportJob {
+  id             String       @id @default(cuid())
+  tenantId       String
+  objectType     String // "Lead" | "Contact" | "Account"
+  status         ImportStatus @default(PENDING)
+  dedupeStrategy String       @default("skip") // skip | update | create
+  mapping        Json         @default("{}") // { csvColumn: targetField }
+  total          Int          @default(0)
+  processed      Int          @default(0)
+  created        Int          @default(0)
+  updated        Int          @default(0)
+  skipped        Int          @default(0)
+  failed         Int          @default(0)
+  errors         Json         @default("[]") // [{ row, reason }]
+  createdById    String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([tenantId, createdAt])
+  @@map("import_jobs")
+}
+
+// Per-tenant API key for the public REST API (sha256-hashed; high entropy).
+model ApiKey {
+  id          String    @id @default(cuid())
+  tenantId    String
+  name        String
+  keyHash     String    @unique // sha256 of the key
+  prefix      String // first chars, for display
+  permissions String[]  @default([])
+  lastUsedAt  DateTime?
+  createdById String?
+  createdAt   DateTime  @default(now())
+  revokedAt   DateTime?
+
+  @@index([tenantId])
+  @@map("api_keys")
+}
+
+// Outbound webhook subscription: POST signed payloads on matching events.
+model WebhookSubscription {
+  id        String   @id @default(cuid())
+  tenantId  String
+  name      String
+  url       String
+  events    String[] @default([]) // e.g. ["lead.created","deal.stage_changed"]
+  secret    String? // for HMAC signature
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  @@index([tenantId])
+  @@map("webhook_subscriptions")
+}
